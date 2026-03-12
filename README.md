@@ -108,16 +108,3 @@ client1@remote> exit
 ```
 
 ---
-
-## How It Maps to Rubric (Deliverable 1)
-
-| Rubric Component | Implementation |
-|---|---|
-| **Problem Definition** | Secure RCE with auth, whitelist, audit log |
-| **Core Socket Implementation** | Raw `socket.socket` + manual `bind/listen/accept` |
-| **SSL/TLS Security** | `ssl.SSLContext` wraps every connection |
-| **Multiple Concurrent Clients** | `threading.Thread` per client |
-| **Authentication Mechanism** | Username + SHA-256 hashed password |
-| **Structured Command Protocol** | JSON messages with 4-byte length prefix |
-| **Audit Logging** | Timestamped log of every login + command |
-| **Deliverable 1 Demo** | 1 server + 2 clients working simultaneously |
