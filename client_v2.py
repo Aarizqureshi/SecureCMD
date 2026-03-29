@@ -3,18 +3,24 @@
  Secure Remote Command Execution System  ─  CLIENT v2
  Project  : Jackfruit Mini Project  (Deliverable 2)
  Language : Python 3 (asyncio)
+ Platform : Windows (adapted)
 =============================================================
 Usage:
-    python client.py
-    python client.py --host 127.0.0.1 --port 9999
+    python client_v2.py
+    python client_v2.py --host 192.168.1.10 --port 9999
 =============================================================
 """
 
 import asyncio, ssl, json, argparse, getpass, sys
 
-DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 9999
-CA_CERT      = "certs/server.crt"
+# ── Windows asyncio fix ───────────────────────────────────
+# SelectorEventLoop is required for TLS on Windows with asyncio.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+DEFAULT_HOST  = "127.0.0.1"
+DEFAULT_PORT  = 9999
+CA_CERT       = "certs/server.crt"
 MAX_MSG_BYTES = 64 * 1024
 
 
@@ -43,6 +49,8 @@ def print_result(res: dict):
     if out:
         print(out)
     if err:
+        # Windows cmd prompt does not interpret ANSI by default;
+        # these codes work fine in Windows Terminal / PowerShell 7.
         print(f"\033[91m[stderr] {err}\033[0m")
     if code not in (0, "?"):
         print(f"\033[93m[exit {code}]\033[0m")
@@ -59,11 +67,11 @@ async def run(host: str, port: int):
     try:
         reader, writer = await asyncio.open_connection(host, port, ssl=context)
     except Exception as e:
-        print(f"\033[91m[✗] Could not connect: {e}\033[0m")
+        print(f"\033[91m[x] Could not connect: {e}\033[0m")
         return
 
     cipher = writer.get_extra_info("ssl_object").cipher()[0]
-    print(f"[✓] TLS connected  |  cipher: {cipher}\n")
+    print(f"[+] TLS connected  |  cipher: {cipher}\n")
 
     try:
         # ── Auth ───────────────────────────────────────────
@@ -76,10 +84,10 @@ async def run(host: str, port: int):
 
         resp = await recv_msg(reader)
         if resp.get("type") == "auth_fail":
-            print(f"\033[91m[✗] {resp.get('msg')}\033[0m")
+            print(f"\033[91m[x] {resp.get('msg')}\033[0m")
             return
 
-        print(f"\033[92m[✓] {resp.get('msg')}\033[0m")
+        print(f"\033[92m[+] {resp.get('msg')}\033[0m")
         role    = resp.get("role", "?")
         allowed = resp.get("allowed_commands", [])
         print(f"    Role     : \033[96m{role}\033[0m")
@@ -89,7 +97,6 @@ async def run(host: str, port: int):
         loop = asyncio.get_event_loop()
         while True:
             try:
-                # read input in executor so asyncio loop stays alive
                 prompt = f"\033[96m{username}({role})@remote>\033[0m "
                 cmd = await loop.run_in_executor(
                     None, lambda: input(prompt).strip()
@@ -128,9 +135,11 @@ async def run(host: str, port: int):
 
 # ── Entry point ───────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="Secure RCE Client v2")
-    parser.add_argument("--host", default=DEFAULT_HOST)
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser = argparse.ArgumentParser(description="Secure RCE Client v2 (Windows)")
+    parser.add_argument("--host", default=DEFAULT_HOST,
+                        help="Server IP address (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT,
+                        help="Server port (default: 9999)")
     args = parser.parse_args()
     asyncio.run(run(args.host, args.port))
 

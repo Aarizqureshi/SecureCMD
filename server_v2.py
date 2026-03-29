@@ -3,6 +3,7 @@
  Secure Remote Command Execution System  ─  SERVER v2
  Project  : Jackfruit Mini Project  (Deliverable 2)
  Language : Python 3 (asyncio — no threads)
+ Platform : Windows (adapted)
 =============================================================
 Upgrades over v1
   [1] asyncio  ─ proper I/O multiplexing (no threads)
@@ -23,9 +24,15 @@ Syllabus mapping
 """
 
 import asyncio, ssl, json, subprocess, hashlib
-import logging, time, os
+import logging, time, os, sys
 from pathlib import Path
 from collections import defaultdict
+
+# ── Windows asyncio fix ───────────────────────────────────
+# On Windows, the default ProactorEventLoop does not support
+# SSL with asyncio.start_server; SelectorEventLoop is required.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # ── Config ────────────────────────────────────────────────
 HOST      = "0.0.0.0"
@@ -40,75 +47,72 @@ LOCKOUT_SECS   = 30             # ban duration in seconds
 
 # ── Role-based command whitelist  [upgrade 2 + 4] ─────────
 #
+# Windows-native commands replace Linux ones.
 # Structure:
 #   ROLES[role] = {
 #       "command": {"allowed_flags": [...], "allowed_path_prefix": "..."}
 #   }
 #
-# allowed_flags  : set of flag strings the user may pass
+# allowed_flags       : set of flag strings the user may pass
 # allowed_path_prefix : if present, path args must start with this
 # (None means no path restriction for that command)
 
 ROLES = {
-    # ── guest: read-only, no path traversal ───────────────
+    # ── guest: read-only, safe info only ──────────────────
     "guest": {
-        "whoami":   {},
-        "date":     {},
-        "uptime":   {},
-        "hostname": {},
-        "uname":    {"allowed_flags": {"-a", "-r", "-n"}},
-        "echo":     {},
-        "id":       {},
-        "pwd":      {},
-        "ls":       {"allowed_flags": {"-l", "-a", "-la", "-al", "-lh"},
-                     "allowed_path_prefix": "/tmp"},
-        "cat":      {"allowed_path_prefix": "/tmp"},
-        "head":     {"allowed_path_prefix": "/tmp"},
-        "tail":     {"allowed_path_prefix": "/tmp"},
+        "whoami":    {},
+        "hostname":  {},
+        "echo":      {},
+        "date":      {},        # prints current date  (cmd /c date /t)
+        "time":      {},        # prints current time  (cmd /c time /t)
+        "ver":       {},        # Windows version
+        "dir":       {"allowed_flags": {"/b", "/w", "/p"},
+                      "allowed_path_prefix": "C:\\Temp"},
+        "type":      {"allowed_path_prefix": "C:\\Temp"},
+        "findstr":   {"allowed_flags": {"/i", "/n", "/c"},
+                      "allowed_path_prefix": "C:\\Temp"},
     },
 
     # ── operator: wider read access ───────────────────────
     "operator": {
-        "whoami":   {},
-        "date":     {},
-        "uptime":   {},
-        "hostname": {},
-        "uname":    {"allowed_flags": {"-a", "-r", "-n", "-m", "-s"}},
-        "echo":     {},
-        "id":       {},
-        "pwd":      {},
-        "env":      {},
-        "df":       {"allowed_flags": {"-h", "-H", "--human-readable"}},
-        "ps":       {"allowed_flags": {"-e", "-f", "-ef", "aux", "-aux"}},
-        "ls":       {"allowed_flags": {"-l", "-a", "-la", "-al", "-lh", "-R"}},
-        "cat":      {"allowed_path_prefix": "/"},
-        "head":     {"allowed_path_prefix": "/"},
-        "tail":     {"allowed_flags": {"-n", "-f", "-F"},
-                     "allowed_path_prefix": "/"},
-        "wc":       {"allowed_flags": {"-l", "-w", "-c"}},
-        "grep":     {"allowed_flags": {"-i", "-r", "-n", "-l", "-v", "-c"}},
+        "whoami":    {},
+        "hostname":  {},
+        "echo":      {},
+        "date":      {},
+        "time":      {},
+        "ver":       {},
+        "ipconfig":  {"allowed_flags": {"/all"}},
+        "tasklist":  {"allowed_flags": {"/v", "/fo", "TABLE", "CSV", "LIST"}},
+        "systeminfo":{},
+        "netstat":   {"allowed_flags": {"-a", "-n", "-o", "-an", "-ano"}},
+        "dir":       {"allowed_flags": {"/b", "/w", "/p", "/s", "/a"},
+                      "allowed_path_prefix": "C:\\"},
+        "type":      {"allowed_path_prefix": "C:\\"},
+        "findstr":   {"allowed_flags": {"/i", "/r", "/n", "/l", "/v", "/c", "/s"}},
+        "wmic":      {"allowed_flags": {"cpu", "os", "computersystem",
+                                        "get", "list", "brief"}},
     },
 
-    # ── admin: full whitelist, no path restriction ─────────
+    # ── admin: full whitelist ─────────────────────────────
     "admin": {
-        "whoami":   {},
-        "date":     {},
-        "uptime":   {},
-        "hostname": {},
-        "uname":    {},
-        "echo":     {},
-        "id":       {},
-        "pwd":      {},
-        "env":      {},
-        "df":       {},
-        "ps":       {},
-        "ls":       {},
-        "cat":      {},
-        "head":     {},
-        "tail":     {},
-        "wc":       {},
-        "grep":     {},
-        "find":     {"allowed_path_prefix": "/tmp"},
+        "whoami":    {},
+        "hostname":  {},
+        "echo":      {},
+        "date":      {},
+        "time":      {},
+        "ver":       {},
+        "ipconfig":  {},
+        "tasklist":  {},
+        "systeminfo":{},
+        "netstat":   {},
+        "dir":       {},
+        "type":      {},
+        "findstr":   {},
+        "wmic":      {},
+        "net":       {"allowed_flags": {"user", "localgroup", "share",
+                                        "use", "view", "start", "stop"}},
+        "ping":      {"allowed_flags": {"-n", "-l", "-w", "-4", "-6"}},
+        "tracert":   {"allowed_flags": {"-d", "-h", "-w", "-4", "-6"}},
     },
 }
 
@@ -128,7 +132,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(message)s",
     handlers=[
-        logging.FileHandler(LOG_FILE),
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
         logging.StreamHandler(),
     ]
 )
@@ -148,7 +152,7 @@ def audit(user: str, ip: str, action: str, detail: str, status: str):
 
 
 # ── Rate limiter (in-memory)  [upgrade 3] ─────────────────
-_fail_counts: dict[str, int]   = defaultdict(int)
+_fail_counts:   dict[str, int]   = defaultdict(int)
 _lockout_until: dict[str, float] = {}
 
 def check_lockout(ip: str) -> float:
@@ -177,7 +181,7 @@ async def send_msg(writer: asyncio.StreamWriter, data: dict):
     await writer.drain()
 
 async def recv_msg(reader: asyncio.StreamReader) -> dict:
-    hdr = await reader.readexactly(4)
+    hdr    = await reader.readexactly(4)
     length = int.from_bytes(hdr, "big")
 
     # [upgrade 5] guard against memory exhaustion
@@ -198,19 +202,23 @@ def validate_args(base: str, parts: list[str], role_cmds: dict) -> str | None:
     if rules is None:
         return f"'{base}' not allowed for your role."
 
-    allowed_flags  = rules.get("allowed_flags", None)   # None = any flag OK
-    path_prefix    = rules.get("allowed_path_prefix", None)
+    allowed_flags = rules.get("allowed_flags", None)   # None = any flag OK
+    path_prefix   = rules.get("allowed_path_prefix", None)
 
     for arg in parts[1:]:
-        if arg.startswith("-"):
-            # It's a flag
+        if arg.startswith("/") or arg.startswith("-"):
+            # It's a flag / switch
             if allowed_flags is not None and arg not in allowed_flags:
                 return f"Flag '{arg}' not allowed for '{base}'."
         else:
             # It's a path / value argument
             if path_prefix is not None:
-                real = os.path.realpath(arg)  # resolve symlinks
-                if not real.startswith(path_prefix):
+                # Resolve real path to prevent traversal attacks
+                try:
+                    real = str(Path(arg).resolve())
+                except Exception:
+                    return f"Invalid path argument: '{arg}'."
+                if not real.lower().startswith(path_prefix.lower()):
                     return (
                         f"Path '{arg}' is outside allowed prefix "
                         f"'{path_prefix}'."
@@ -218,14 +226,23 @@ def validate_args(base: str, parts: list[str], role_cmds: dict) -> str | None:
     return None  # all good
 
 
-# ── Command execution ─────────────────────────────────────
+# ── Windows command execution ─────────────────────────────
+# Many Windows built-in commands (date, time, dir, etc.) are
+# shell built-ins and must be run via cmd.exe /c.
+SHELL_BUILTINS = {
+    "date", "time", "dir", "ver", "echo", "type",
+    "findstr", "net", "ipconfig", "tasklist",
+    "systeminfo", "netstat", "wmic", "ping",
+    "tracert", "whoami", "hostname",
+}
+
 def run_command(cmd: str, role: str) -> dict:
-    parts = cmd.strip().split()
+    parts     = cmd.strip().split()
     if not parts:
         return {"out": "", "err": "Empty command.", "code": -1}
 
-    base       = parts[0]
-    role_cmds  = ROLES.get(role, {})
+    base      = parts[0].lower()
+    role_cmds = ROLES.get(role, {})
 
     # Check base command allowed for role
     if base not in role_cmds:
@@ -241,10 +258,17 @@ def run_command(cmd: str, role: str) -> dict:
     if err:
         return {"out": "", "err": err, "code": 403}
 
-    # Execute
+    # Execute via cmd.exe shell for built-ins; direct otherwise
     try:
+        use_shell = base in SHELL_BUILTINS
         r = subprocess.run(
-            parts, capture_output=True, text=True, timeout=10
+            cmd if use_shell else parts,
+            shell=use_shell,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            encoding="utf-8",
+            errors="replace",
         )
         return {"out": r.stdout, "err": r.stderr, "code": r.returncode}
     except subprocess.TimeoutExpired:
@@ -280,7 +304,7 @@ async def handle_client(reader: asyncio.StreamReader,
         user    = creds.get("username", "")
         pw_hash = hashlib.sha256(creds.get("password", "").encode()).hexdigest()
 
-        stored  = USERS.get(user)
+        stored = USERS.get(user)
         if not stored or stored[0] != pw_hash:
             await send_msg(writer, {"type": "auth_fail", "msg": "Invalid credentials."})
             record_fail(ip)

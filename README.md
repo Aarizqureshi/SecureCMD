@@ -1,197 +1,459 @@
-# Secure Remote Command Execution System
+# Secure Remote Command Execution System — v2
+**Jackfruit Mini Project · Deliverable 2 · Windows Edition**
 
-A client-server system where authenticated clients connect over a **TLS-encrypted TCP socket** and remotely execute shell commands on the server. The server responds with the command output.
-
-```
-[client1 — guest]    ──TLS──┐
-                             ├──► server ──► shell ──► response
-[client2 — operator] ──TLS──┤
-                             │
-[admin]              ──TLS──┘
-```
+A role-based remote command shell secured with TLS, built entirely on Python's standard library. A single server accepts multiple simultaneous clients. Each client authenticates, receives a role, and can only run the commands that role permits — all traffic encrypted end-to-end.
 
 ---
 
-## Project Structure
+## Table of Contents
 
-```
-secure_rce/
-├── server.py          # Async TLS server
-├── client.py          # Async TLS client
-├── certs/
-│   ├── server.crt     # Self-signed TLS certificate
-│   └── server.key     # Private key
-└── logs/
-    └── audit.log      # Audit trail (auto-created)
-```
-
----
-
-## Setup & Run
-
-### Step 1 — Generate TLS Certificate (one-time)
-```bash
-mkdir -p certs
-openssl req -x509 -newkey rsa:2048 -keyout certs/server.key \
-  -out certs/server.crt -days 365 -nodes \
-  -subj "/CN=localhost/O=SecureRCE/C=IN"
-```
-
-### Step 2 — Start the Server
-```bash
-python server.py
-```
-
-### Step 3 — Connect a Client
-```bash
-python client.py
-
-# Or with explicit host/port
-python client.py --host 127.0.0.1 --port 9999
-```
+1. [How It Works](#1-how-it-works)
+2. [Prerequisites](#2-prerequisites)
+3. [Folder Structure](#3-folder-structure)
+4. [Server Setup](#4-server-setup-step-by-step)
+5. [Client Setup](#5-client-setup-step-by-step)
+6. [Using the Shell](#6-using-the-shell)
+7. [Credentials & Roles](#7-credentials--roles)
+8. [Troubleshooting](#8-troubleshooting)
+9. [Security Notes](#9-security-notes)
 
 ---
 
-## Users & Roles
+## 1. How It Works
 
-| Username | Password  | Role     |
-|----------|-----------|----------|
-| client1  | pass1234  | guest    |
-| client2  | secure99  | operator |
-| admin    | admin123  | admin    |
+### 1.1 Overall Architecture
 
-Each role gets a different set of allowed commands and access levels.
+```
+  CLIENT A ──┐
+             ├──(TLS/TCP)──► SERVER (asyncio, single thread)
+  CLIENT B ──┘                  │
+                                ├─ authenticates each client
+                                ├─ checks role & command whitelist
+                                ├─ runs command via subprocess
+                                └─ streams result back
+```
+
+The server runs a single asyncio event loop. Each connected client gets its own `handle_client` coroutine. While one client waits on I/O, the loop services others — no threads needed.
 
 ---
 
-## Roles & Permissions
+### 1.2 TLS Connection
 
-### guest
-Read-only access. File paths restricted to `/tmp`.
-```
-whoami  date  uptime  hostname  uname  echo  id  pwd
-ls  cat  head  tail
-```
+The server wraps its TCP socket with TLS using a self-signed certificate (`server.crt` / `server.key`). The client loads `server.crt` as its trust anchor and verifies the server's identity before any data is exchanged. **No plaintext crosses the network at any point.**
 
-### operator
-Broader read access across the full filesystem.
-```
-whoami  date  uptime  hostname  uname  echo  id  pwd
-env  df  ps  ls  cat  head  tail  wc  grep
-```
-
-### admin
-Full access to all allowed commands.
-```
-whoami  date  uptime  hostname  uname  echo  id  pwd
-env  df  ps  ls  cat  head  tail  wc  grep  find
-```
-
-Any command not in the list is **rejected with code 403**.
+> **Why self-signed?** Acceptable for a controlled lab. In production, use a CA-signed certificate and set `check_hostname = True` in the client.
 
 ---
 
-## Argument Sandboxing
+### 1.3 Message Framing (Length-Prefix Protocol)
 
-Beyond the command whitelist, arguments are also validated before execution:
+Every message — auth packets, commands, results — is sent as UTF-8 JSON with a **4-byte big-endian length header** prepended.
 
-- **Flags** — each command has an allowed set of flags. Anything outside it is rejected.
-  - e.g. `uname -z` → blocked for guest, `uname -a` → allowed
-- **Paths** — file path arguments must resolve within the role's allowed prefix.
-  - e.g. `cat /etc/passwd` → blocked for guest (outside `/tmp`)
-  - Symlinks are resolved with `os.path.realpath()` before the check
+```
+┌──────────────────────┬────────────────────────────────┐
+│  4 bytes (length)    │  N bytes (JSON payload)        │
+└──────────────────────┴────────────────────────────────┘
+```
+
+The receiver reads exactly 4 bytes, converts to an integer, then reads exactly that many bytes of JSON. This eliminates any ambiguity about message boundaries. Messages over 64 KB are rejected on both sides to prevent memory exhaustion.
 
 ---
 
-## Authentication & Rate Limiting
-
-Auth flow on every new connection:
+### 1.4 Authentication Flow
 
 ```
-client                              server
-  |── TLS handshake ──────────────► |
-  |◄── { auth_request } ─────────── |
-  |── { username, password } ──────► |   (SHA-256 compared)
-  |◄── { auth_ok, role, commands } ── |
-  |── { command: "whoami" } ────────► |
-  |◄── { out, err, code } ─────────── |
-  |── { disconnect } ───────────────► |
+SERVER                              CLIENT
+  │                                    │
+  │── { type: "auth_request" } ───────►│
+  │                                    │  (user types username + password)
+  │◄── { type: "auth", username, pw } ─│
+  │                                    │
+  │  [SHA-256 hash pw, compare to DB]  │
+  │                                    │
+  │── { type: "auth_ok",  ────────────►│   ← includes role + allowed commands
+  │     role, allowed_commands }        │
+  │                        OR           │
+  │── { type: "auth_fail" } ──────────►│   ← failure counter incremented for IP
 ```
 
-**Rate limiting:** 5 consecutive failed logins from the same IP triggers a 30-second ban. The ban is checked before credentials are even requested.
+Passwords are **never stored in plain text** — only their SHA-256 hashes are in the user database.
 
 ---
 
-## Message Protocol
+### 1.5 Rate Limiting & IP Lockout
 
-All messages use a **4-byte big-endian length prefix** followed by a UTF-8 JSON payload.
+The server tracks authentication failures per IP address in memory.
 
-```
-[ 4 bytes — message length ][ JSON payload ]
-```
+| Setting | Value |
+|---|---|
+| Failures before lockout | 5 |
+| Lockout duration | 30 seconds |
+| Scope | Per connecting IP address |
+| Reset on | Successful login |
 
-Messages larger than **64 KB** are rejected immediately before any memory is allocated.
-
-| Direction | `type`        | Key fields                    | Description                        |
-|-----------|---------------|-------------------------------|------------------------------------|
-| S → C     | auth_request  | msg                           | Server prompts for credentials     |
-| C → S     | auth          | username, password            | Client sends credentials           |
-| S → C     | auth_ok       | msg, role, allowed_commands   | Auth success with role info        |
-| S → C     | auth_fail     | msg                           | Auth failure or IP ban             |
-| C → S     | command       | command                       | Shell command string               |
-| S → C     | result        | out, err, code                | stdout, stderr, exit code          |
-| C → S     | disconnect    | —                             | Clean disconnect                   |
+A banned IP receives an immediate `auth_fail` and the connection is dropped before the handshake even starts.
 
 ---
 
-## Audit Log
+### 1.6 Role-Based Access Control (RBAC)
 
-Every event is written as a JSON line to `logs/audit.log`.
+Three roles exist, each with a fixed whitelist of Windows commands. For every incoming command the server checks three things in order:
+
+1. **Is the base command in this role's whitelist?** If not → `403 error`, not executed.
+2. **Are all flags in the `allowed_flags` set for this command?** If not → `403 error`.
+3. **If the command takes a path, does the resolved path start with `allowed_path_prefix`?** `Path.resolve()` is used to defeat symlink and `..` traversal tricks.
+
+| Role | Allowed Commands | Path Restriction |
+|---|---|---|
+| `guest` | `whoami`, `hostname`, `echo`, `date`, `time`, `ver`, `dir`, `type`, `findstr` | `dir` / `type` / `findstr` → `C:\Temp` only |
+| `operator` | All guest commands + `ipconfig`, `tasklist`, `systeminfo`, `netstat`, `wmic` | `dir` / `type` → anywhere under `C:\` |
+| `admin` | All operator commands + `net`, `ping`, `tracert` | No path restriction |
+
+---
+
+### 1.7 Windows Command Execution
+
+Many Windows commands (`dir`, `echo`, `type`, `ver`, etc.) are **shell built-ins inside `cmd.exe`** — they cannot be launched as standalone executables. The server handles this:
+
+```python
+SHELL_BUILTINS = {"date", "time", "dir", "ver", "echo", "type", ...}
+
+# shell built-ins → run via cmd.exe
+subprocess.run(cmd, shell=True, ...)
+
+# standalone executables (ping, whoami, etc.) → direct launch, safer
+subprocess.run(parts, shell=False, ...)
+```
+
+Both paths are still gated through the role whitelist before execution. Output is captured as UTF-8, decoded with `errors="replace"` to handle any encoding edge cases, and sent back inside a `result` message.
+
+---
+
+### 1.8 Audit Logging
+
+Every significant event is written as a JSON line to `logs/audit.log`:
 
 ```json
-{"ts":"2026-03-12T10:00:01Z","user":"client1","ip":"127.0.0.1","action":"LOGIN","detail":"role=guest","status":"SUCCESS"}
-{"ts":"2026-03-12T10:00:03Z","user":"client1","ip":"127.0.0.1","action":"CMD","detail":"whoami","status":"code=0"}
-{"ts":"2026-03-12T10:00:05Z","user":"client1","ip":"127.0.0.1","action":"CMD","detail":"cat /etc/passwd","status":"code=403"}
-{"ts":"2026-03-12T10:00:10Z","user":"client1","ip":"127.0.0.1","action":"DISCONNECT","detail":"","status":"OK"}
-{"ts":"2026-03-12T10:01:00Z","user":"hacker","ip":"127.0.0.1","action":"LOGIN","detail":"","status":"FAIL"}
+{"ts":"2025-01-01T12:00:00Z","user":"client2","ip":"192.168.1.5","action":"CMD","detail":"ipconfig /all","status":"code=0"}
+```
+
+Fields: `ts` (UTC timestamp), `user`, `ip`, `action`, `detail`, `status`. The log is also mirrored to the server's console window.
+
+---
+
+## 2. Prerequisites
+
+Install the following on **all machines** (server and both clients) before doing anything else.
+
+| Requirement | Notes |
+|---|---|
+| **Python 3.11+** | Download from [python.org](https://python.org/downloads). During install, tick **"Add Python to PATH"**. |
+| **OpenSSL** | Needed only on the **server** to generate the certificate. The easiest way to get it on Windows is via **Git for Windows** ([git-scm.com](https://git-scm.com)). |
+| **C:\Temp folder** | Must exist on the **server** for guest-role path restrictions to work. |
+| **No third-party packages** | Everything uses the Python standard library only (`asyncio`, `ssl`, `json`, `subprocess`, `hashlib`, `logging`). |
+
+> **Verify Python is installed correctly** — open a new Command Prompt and run:
+> ```
+> python --version
+> ```
+> You should see `Python 3.11.x` or higher.
+
+---
+
+## 3. Folder Structure
+
+```
+project\
+    server_v2.py
+    client_v2.py
+    certs\
+        server.crt      ← certificate  (copy this file to clients)
+        server.key      ← private key  (server only — never share this)
+    logs\               ← created automatically on first server start
+        audit.log
+```
+
+On **client machines**, you only need:
+```
+project\
+    client_v2.py
+    certs\
+        server.crt      ← copied from the server
 ```
 
 ---
 
-## Example Session
+## 4. Server Setup (Step-by-Step)
+
+### Step 1 — Create the project folders
+
+Open **Command Prompt** and run:
+
+```cmd
+mkdir C:\project
+mkdir C:\project\certs
+mkdir C:\Temp
+```
+
+Copy `server_v2.py` into `C:\project\`.
+
+---
+
+### Step 2 — Generate the TLS certificate
+
+Open **Git Bash** (right-click the Start menu → Git Bash) and run this single command:
+
+```bash
+cd /c/project/certs
+openssl req -x509 -newkey rsa:2048 -keyout server.key -out server.crt -days 365 -nodes -subj "/CN=localhost"
+```
+
+You should now have two files in `C:\project\certs\`:
+- `server.crt` — the certificate (share this with clients)
+- `server.key` — the private key (**never share this**)
+
+---
+
+### Step 3 — Allow port 9999 through Windows Firewall
+
+Open **PowerShell as Administrator** and run:
+
+```powershell
+New-NetFirewallRule -DisplayName "RCE Server" -Direction Inbound -Protocol TCP -LocalPort 9999 -Action Allow
+```
+
+---
+
+### Step 4 — Start the server
+
+```cmd
+cd C:\project
+python server_v2.py
+```
+
+Expected output:
+```
+2025-01-01 12:00:00  [*] Secure RCE Server v2  listening on 0.0.0.0:9999  (asyncio + TLS)
+2025-01-01 12:00:00  [*] Roles: ['guest', 'operator', 'admin']
+2025-01-01 12:00:00  [*] Audit log -> logs/audit.log
+```
+
+The server is now running. **Keep this window open.** Press `Ctrl+C` to stop it.
+
+---
+
+### Step 5 — Find the server's IP address
+
+You will need this for the clients to connect.
+
+```cmd
+ipconfig
+```
+
+Look for **IPv4 Address** under your active network adapter (e.g. `192.168.1.10`). Note it down.
+
+---
+
+## 5. Client Setup (Step-by-Step)
+
+Repeat these steps on **each client machine**.
+
+### Step 1 — Create the project folder
+
+```cmd
+mkdir C:\project
+mkdir C:\project\certs
+```
+
+Copy `client_v2.py` into `C:\project\`.
+
+---
+
+### Step 2 — Copy the server certificate to the client
+
+Copy `server.crt` from the server's `C:\project\certs\` to the **same path** on the client: `C:\project\certs\server.crt`.
+
+You can transfer the file using any of these methods:
+- USB drive
+- Shared folder: `\\<SERVER-IP>\SharedFolder`
+- Quick Python HTTP server on the server (run `python -m http.server 8080` in `C:\project\certs\`, then open `http://<SERVER-IP>:8080/server.crt` in the client's browser and save the file)
+
+> **Do NOT copy `server.key` to clients.** That is the server's private key.
+
+---
+
+### Step 3 — Connect to the server
+
+```cmd
+cd C:\project
+python client_v2.py --host 192.168.1.10 --port 9999
+```
+
+Replace `192.168.1.10` with the actual server IP from Step 5 of the server setup.
+
+If running the client **on the same machine as the server**, omit `--host` entirely (it defaults to `127.0.0.1`):
+
+```cmd
+python client_v2.py
+```
+
+---
+
+### Step 4 — Log in
+
+The client will prompt for credentials:
 
 ```
-[*] Connecting to 127.0.0.1:9999 (TLS) ...
-[✓] TLS connected  |  cipher: TLS_AES_256_GCM_SHA384
+[*] Connecting to 192.168.1.10:9999 (TLS) ...
+[+] TLS connected  |  cipher: TLS_AES_256_GCM_SHA384
 
 [server] Send credentials
 Username: client1
-Password: ****
-[✓] Welcome client1! Role: guest. Type a command.
+Password:
+[+] Welcome client1! Role: guest. Type a command.
     Role     : guest
-    Commands : cat, date, echo, head, hostname, id, ls, pwd, tail, uname, uptime, whoami
-
-client1(guest)@remote> whoami
-root
-
-client1(guest)@remote> cat /etc/passwd
-[stderr] Path '/etc/passwd' is outside allowed prefix '/tmp'.
-[exit 403]
-
-client1(guest)@remote> cat /tmp/notes.txt
-hello from /tmp
-
-client1(guest)@remote> exit
-[*] Disconnected.
+    Commands : date, dir, echo, findstr, hostname, time, type, ver, whoami
 ```
 
 ---
 
-## Security Notes
+## 6. Using the Shell
 
-- All traffic is TLS-encrypted — no plaintext on the wire
-- Passwords are compared as SHA-256 hashes
-- Commands and arguments are both validated before any execution
-- Symlink traversal is blocked via `os.path.realpath()`
-- Oversized messages are dropped before memory allocation
-- Brute-force is slowed by IP lockout after 5 failed attempts
+### Running commands
+
+Type any command from your allowed list and press Enter:
+
+```
+client1(guest)@remote> whoami
+DESKTOP-ABC\user
+
+client1(guest)@remote> ver
+Microsoft Windows [Version 10.0.22621.3447]
+
+client1(guest)@remote> dir C:\Temp
+ Volume in drive C has no label.
+ Directory of C:\Temp
+...
+```
+
+- **stdout** — printed normally
+- **stderr** — printed in red, prefixed with `[stderr]`
+- **Non-zero exit code** — shown in yellow as `[exit N]`
+
+---
+
+### Special client commands
+
+| Command | What it does |
+|---|---|
+| `help` | Lists your allowed commands (no server round-trip) |
+| `exit` / `quit` / `q` | Sends a clean disconnect message and exits |
+| `Ctrl+C` | Also triggers a clean disconnect |
+
+---
+
+### Command examples by role
+
+**guest**
+```
+whoami
+hostname
+ver
+date /t
+time /t
+dir C:\Temp
+type C:\Temp\notes.txt
+findstr /i "error" C:\Temp\log.txt
+```
+
+**operator** (all guest commands, plus)
+```
+ipconfig /all
+tasklist /v
+netstat -ano
+systeminfo
+wmic cpu get name
+dir C:\Windows\System32
+type C:\Windows\System32\drivers\etc\hosts
+```
+
+**admin** (all operator commands, plus)
+```
+net user
+net localgroup Administrators
+ping -n 4 8.8.8.8
+tracert -d google.com
+wmic os list brief
+net share
+```
+
+---
+
+## 7. Credentials & Roles
+
+These are the default built-in accounts. **Change them before any real use** by editing the `USERS` dictionary in `server_v2.py`.
+
+| Username | Password | Role |
+|---|---|---|
+| `client1` | `pass1234` | `guest` |
+| `client2` | `secure99` | `operator` |
+| `admin` | `admin123` | `admin` |
+
+To add or change a user, edit `server_v2.py`:
+
+```python
+def _h(pw: str) -> str:
+    return hashlib.sha256(pw.encode()).hexdigest()
+
+USERS = {
+    "alice": (_h("mynewpassword"), "operator"),
+    "admin": (_h("changemeplease"), "admin"),
+}
+```
+
+---
+
+## 8. Troubleshooting
+
+| Problem | Likely Cause | Fix |
+|---|---|---|
+| `[x] Could not connect` | Server not running, wrong IP, or firewall blocking 9999 | Check the server terminal; verify IP with `ipconfig`; add the firewall rule (Section 4 Step 3) |
+| `SSL: CERTIFICATE_VERIFY_FAILED` | Client does not have the server certificate | Copy `server.crt` to the client's `certs\` folder |
+| `403` / command not allowed | Command not in your role's whitelist | Run `help` to see your allowed commands |
+| `Path outside allowed prefix` | Tried to access a path outside your role's allowed directory | `guest`: use `C:\Temp` only; `operator`: use paths under `C:\` |
+| `IP banned. Try again in Xs` | 5 consecutive failed login attempts from your IP | Wait 30 seconds, then retry with correct credentials |
+| `'python' is not recognized` | Python not in PATH | Reinstall Python and tick "Add Python to PATH", or use the full path: `C:\Python312\python.exe` |
+| Server crashes with asyncio SSL error | Wrong event loop policy | Ensure the `WindowsSelectorEventLoopPolicy` line is at the top of `server_v2.py` (already included in v2) |
+| Output shows garbled characters | Encoding mismatch | The server uses `encoding="utf-8", errors="replace"` — if garbling persists, run the server in a terminal that supports UTF-8 (Windows Terminal is recommended) |
+
+---
+
+## 9. Security Notes
+
+- **Passwords are hashed.** SHA-256 hashes are stored in `USERS`. Plain-text passwords are never written to disk or logs.
+- **The certificate is self-signed.** Fine for a lab. For production: get a CA-signed cert and set `check_hostname = True` in the client.
+- **Argument validation is server-side.** Clients cannot bypass flag or path restrictions by modifying their copy of the script.
+- **Shell injection is mitigated.** Commands are split into a list and passed to `subprocess`. Only known shell built-ins use `shell=True`, and those commands are still checked against the whitelist before execution.
+- **The audit log records everything.** Review `logs\audit.log` regularly. Each line is a JSON object parseable with PowerShell or `jq`.
+- **Rate limiting is in-memory only.** Restarting the server resets all failure counters and lockouts.
+
+---
+
+## Quick Reference
+
+```
+# Start the server
+cd C:\project
+python server_v2.py
+
+# Connect from the same machine
+python client_v2.py
+
+# Connect from a remote machine
+python client_v2.py --host <SERVER-IP> --port 9999
+
+# Default port:    9999 (TCP)
+# Certificate:     certs\server.crt  (both machines)
+# Audit log:       logs\audit.log    (server only)
+# Stop server:     Ctrl+C
+```
