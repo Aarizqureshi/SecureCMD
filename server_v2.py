@@ -294,15 +294,12 @@ def run_command(cmd: str, role: str) -> dict:
 
     base      = parts[0].lower()
     role_cmds = ROLES.get(role, {})
-<<<<<<< HEAD
 
     # Force non-interactive mode for date/time — without /t they open
     # an interactive prompt and hang the subprocess forever.
     if base in ("date", "time") and "/t" not in [p.lower() for p in parts[1:]]:
         parts.append("/t")
         cmd = " ".join(parts)
-=======
->>>>>>> fc9043ac4fa2750f376cf35dc326e33f35051a24
 
     # Check base command allowed for role
     if base not in role_cmds:

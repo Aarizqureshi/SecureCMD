@@ -20,13 +20,9 @@ if sys.platform == "win32":
 
 DEFAULT_HOST  = "127.0.0.1"
 DEFAULT_PORT  = 9999
-<<<<<<< HEAD
 CA_CERT       = "certs/ca.crt"        # CA that signed the server cert
 CLIENT_CERT   = "certs/client.crt"    # this client's certificate
 CLIENT_KEY    = "certs/client.key"    # this client's private key
-=======
-CA_CERT       = "certs/server.crt"
->>>>>>> fc9043ac4fa2750f376cf35dc326e33f35051a24
 MAX_MSG_BYTES = 64 * 1024
 
 
