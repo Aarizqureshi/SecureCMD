@@ -37,9 +37,12 @@ if sys.platform == "win32":
 # ── Config ────────────────────────────────────────────────
 HOST      = "0.0.0.0"
 PORT      = 9999
-CERT_FILE = "certs/server.crt"
-KEY_FILE  = "certs/server.key"
-LOG_FILE  = "logs/audit.log"
+CERT_FILE   = "certs/server.crt"
+KEY_FILE    = "certs/server.key"
+CA_CERT     = "certs/ca.crt"          # CA that signs client certificates
+CLIENT_CERT = "certs/client.crt"      # client's own certificate (client-side)
+CLIENT_KEY  = "certs/client.key"      # client's private key    (client-side)
+LOG_FILE    = "logs/audit.log"
 
 MAX_MSG_BYTES  = 64 * 1024      # 64 KB max per message  [upgrade 5]
 AUTH_FAIL_MAX  = 5              # lockout after N failures [upgrade 3]
@@ -117,14 +120,62 @@ ROLES = {
 }
 
 # ── User DB  { username: (sha256_hash, role) } ────────────
-def _h(pw: str) -> str:
-    return hashlib.sha256(pw.encode()).hexdigest()
+#
+# Credentials are loaded from users.json — NOT hardcoded here.
+# Format of users.json:
+#   {
+#     "client1": {"password_sha256": "<hex>", "role": "guest"},
+#     "admin":   {"password_sha256": "<hex>", "role": "admin"}
+#   }
+#
+# To generate a hash for a new password, run:
+#   python -c "import hashlib; print(hashlib.sha256(b'yourpassword').hexdigest())"
+#
+USERS_FILE = "users.json"
 
-USERS = {
-    "client1": (_h("pass1234"), "guest"),
-    "client2": (_h("secure99"), "operator"),
-    "admin"  : (_h("admin123"), "admin"),
-}
+def _load_users(path: str) -> dict:
+    """Load user credentials from a JSON file.  Aborts if file is missing."""
+    p = Path(path)
+    if not p.exists():
+        # Create a template file and exit — never fall back to defaults.
+        template = {
+            "client1": {
+                "password_sha256": "REPLACE_WITH_SHA256_HASH",
+                "role": "guest"
+            },
+            "client2": {
+                "password_sha256": "REPLACE_WITH_SHA256_HASH",
+                "role": "operator"
+            },
+            "admin": {
+                "password_sha256": "REPLACE_WITH_SHA256_HASH",
+                "role": "admin"
+            },
+        }
+        p.write_text(json.dumps(template, indent=2), encoding="utf-8")
+        print(f"[!] '{path}' not found — a template has been created.")
+        print( "    Fill in the password_sha256 fields, then restart the server.")
+        print( "    Generate a hash:  python -c \"import hashlib; print(hashlib.sha256(b'pw').hexdigest())\"")
+        sys.exit(1)
+
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    users = {}
+    for username, entry in raw.items():
+        h    = entry.get("password_sha256", "")
+        role = entry.get("role", "guest")
+        if h == "REPLACE_WITH_SHA256_HASH" or not h:
+            print(f"[!] User '{username}' in {path} has no valid password hash — skipping.")
+            continue
+        if role not in ROLES:
+            print(f"[!] User '{username}' has unknown role '{role}' — skipping.")
+            continue
+        users[username] = (h, role)
+    if not users:
+        print(f"[!] No valid users found in '{path}'. Aborting.")
+        sys.exit(1)
+    return users
+
+USERS: dict = {}   # populated in main() after ROLES is defined
 
 # ── Logging ───────────────────────────────────────────────
 Path("logs").mkdir(exist_ok=True)
@@ -243,6 +294,15 @@ def run_command(cmd: str, role: str) -> dict:
 
     base      = parts[0].lower()
     role_cmds = ROLES.get(role, {})
+<<<<<<< HEAD
+
+    # Force non-interactive mode for date/time — without /t they open
+    # an interactive prompt and hang the subprocess forever.
+    if base in ("date", "time") and "/t" not in [p.lower() for p in parts[1:]]:
+        parts.append("/t")
+        cmd = " ".join(parts)
+=======
+>>>>>>> fc9043ac4fa2750f376cf35dc326e33f35051a24
 
     # Check base command allowed for role
     if base not in role_cmds:
@@ -363,8 +423,17 @@ async def handle_client(reader: asyncio.StreamReader,
 
 # ── Main ──────────────────────────────────────────────────
 async def main():
+    global USERS
+    USERS = _load_users(USERS_FILE)
+    log.info(f"[*] Loaded {len(USERS)} user(s) from {USERS_FILE}")
+
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(certfile=CERT_FILE, keyfile=KEY_FILE)
+    # ── Mutual TLS: require a valid client certificate ────
+    # CERT_REQUIRED means the TLS handshake fails immediately if the
+    # client cannot present a certificate signed by CA_CERT.
+    context.verify_mode = ssl.CERT_REQUIRED
+    context.load_verify_locations(CA_CERT)
 
     server = await asyncio.start_server(
         handle_client, HOST, PORT, ssl=context

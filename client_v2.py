@@ -20,7 +20,13 @@ if sys.platform == "win32":
 
 DEFAULT_HOST  = "127.0.0.1"
 DEFAULT_PORT  = 9999
+<<<<<<< HEAD
+CA_CERT       = "certs/ca.crt"        # CA that signed the server cert
+CLIENT_CERT   = "certs/client.crt"    # this client's certificate
+CLIENT_KEY    = "certs/client.key"    # this client's private key
+=======
 CA_CERT       = "certs/server.crt"
+>>>>>>> fc9043ac4fa2750f376cf35dc326e33f35051a24
 MAX_MSG_BYTES = 64 * 1024
 
 
@@ -58,10 +64,11 @@ def print_result(res: dict):
 
 # ── Main coroutine ────────────────────────────────────────
 async def run(host: str, port: int):
-    # TLS context: verify server cert
+    # TLS context: verify server cert + present our own client cert
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    context.load_verify_locations(CA_CERT)
-    context.check_hostname = False   # self-signed cert
+    context.load_verify_locations(CA_CERT)        # trust the CA
+    context.load_cert_chain(CLIENT_CERT, CLIENT_KEY)  # our identity
+    context.check_hostname = False   # self-signed / lab use
 
     print(f"[*] Connecting to {host}:{port} (TLS) ...")
     try:
